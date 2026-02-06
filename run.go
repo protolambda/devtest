@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"runtime/debug"
 	"sync"
 
 	"github.com/protolambda/proto-log/log"
@@ -44,6 +45,7 @@ func Run(ctx context.Context, logger log.Logger, fn func(p P)) context.Context {
 		errOutLock.Lock()
 		defer errOutLock.Unlock()
 		errOut = errors.Join(errOut, RunCritErr)
+		errOut = errors.Join(errOut, errors.New("stack:\n"+string(debug.Stack())))
 		runtime.Goexit() // deferred calls will still run
 	}
 	// SkipNow = immediate stop, might be after previous non-crit error
@@ -75,6 +77,7 @@ func Run(ctx context.Context, logger log.Logger, fn func(p P)) context.Context {
 					x = fmt.Errorf("run panic(msg): %q", e)
 				}
 				errOut = errors.Join(errOut, x, RunCritErr)
+				errOut = errors.Join(errOut, errors.New("stack:\n"+string(debug.Stack())))
 			}
 			cancelCause(errOut)
 		}()
