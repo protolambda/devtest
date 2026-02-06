@@ -2,7 +2,9 @@ package devtest_test
 
 import (
 	"context"
+	"errors"
 	"os"
+	"strings"
 
 	"github.com/protolambda/devtest"
 	"github.com/protolambda/mustbe/be"
@@ -50,13 +52,25 @@ func ExampleMustNotSkip() {
 	out := devtest.Run(ctx, logger, work)
 	// This runs on its own routine. Await the completion.
 	<-out.Done()
-	logger.Info("reason:", "err", context.Cause(out))
+
+	// Use errors.As to extract the RunError and access error and stack separately
+	cause := context.Cause(out)
+	var runErr devtest.RunError
+	if !errors.As(cause, &runErr) {
+		panic("expected a RunError")
+	}
+	// Get the wrapped error (without stack trace in message)
+	logger.Info("wrapped error:", "err", runErr.Unwrap())
+	// Get just the stack trace
+	hasStack := strings.Contains(runErr.Stack(), "goroutine")
+	logger.Info("has stack trace:", "has", hasStack)
 	logger.Info("Done!")
 
 	// Output:
 	// INFO  Hello world                              foo=123
 	// ERROR Unexpected test-skip
 	//
-	// INFO  reason:                                  err="run err: Unexpected test-skip\n\ncritical error"
+	// INFO  wrapped error:                           err="run err: Unexpected test-skip\n\ncritical error"
+	// INFO  has stack trace:                         has=true
 	// INFO  Done!
 }

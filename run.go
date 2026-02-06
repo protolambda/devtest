@@ -44,8 +44,10 @@ func Run(ctx context.Context, logger log.Logger, fn func(p P)) context.Context {
 	onFailNow := func() {
 		errOutLock.Lock()
 		defer errOutLock.Unlock()
-		errOut = errors.Join(errOut, RunCritErr)
-		errOut = errors.Join(errOut, errors.New("stack:\n"+string(debug.Stack())))
+		errOut = &runError{
+			err:   errors.Join(errOut, RunCritErr),
+			stack: string(debug.Stack()),
+		}
 		runtime.Goexit() // deferred calls will still run
 	}
 	// SkipNow = immediate stop, might be after previous non-crit error
@@ -76,8 +78,10 @@ func Run(ctx context.Context, logger log.Logger, fn func(p P)) context.Context {
 				} else {
 					x = fmt.Errorf("run panic(msg): %q", e)
 				}
-				errOut = errors.Join(errOut, x, RunCritErr)
-				errOut = errors.Join(errOut, errors.New("stack:\n"+string(debug.Stack())))
+				errOut = &runError{
+					err:   errors.Join(errOut, x, RunCritErr),
+					stack: string(debug.Stack()),
+				}
 			}
 			cancelCause(errOut)
 		}()
