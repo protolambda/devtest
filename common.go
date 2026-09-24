@@ -3,6 +3,7 @@ package devtest
 import (
 	"context"
 	"log/slog"
+	"testing"
 	"time"
 
 	"github.com/protolambda/mustbe/assertion"
@@ -16,7 +17,7 @@ type TestDeadline interface {
 
 // TestParallel is implemented by *testing.T, but not *testing.B and others.
 type TestParallel interface {
-	Parallel() bool
+	Parallel()
 }
 
 // CommonT is a subset of testing.T, extended with a few common utils.
@@ -76,4 +77,33 @@ func AddTestScope(ctx context.Context, scope string) context.Context {
 	prev := TestScope(ctx)
 	newScope := testScopeValue(prev + "/" + scope)
 	return context.WithValue(ctx, testScopeCtxKey, newScope)
+}
+
+// scopeContext creates the context of a test-scope, like testing.TB.Context:
+// it is canceled just before the Cleanup functions of tb run.
+// The context has the values of parent, and is canceled when parent is done.
+func scopeContext(parent context.Context, tb testing.TB) context.Context {
+	// Derived from the tb context, the context is canceled synchronously with it,
+	// before the testing package runs the cleanup functions.
+	ctx, cancel := context.WithCancel(valuesContext{Context: tb.Context(), values: parent})
+	stop := context.AfterFunc(parent, cancel)
+	tb.Cleanup(func() {
+		stop()
+		// The tb context is canceled by now, unless tb is a custom testing.TB implementation.
+		cancel()
+	})
+	return ctx
+}
+
+// valuesContext is the Context, with a fallback to the values of another context.
+type valuesContext struct {
+	context.Context
+	values context.Context
+}
+
+func (c valuesContext) Value(key any) any {
+	if v := c.Context.Value(key); v != nil {
+		return v
+	}
+	return c.values.Value(key)
 }

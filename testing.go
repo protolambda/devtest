@@ -20,6 +20,12 @@ var (
 	RootContext = context.Background()
 )
 
+// T is the test-scope testing interface.
+//
+// T embeds testing.TB, so it can be passed to code that expects a testing.TB,
+// and new testing.TB features are forwarded without changes to T.
+// The methods that produce output (Log, Logf, Error, Errorf, Fatal, Fatalf, Skip, Skipf)
+// are routed through the Logger instead, and attributed to the first caller that is not marked with Helper.
 type T interface {
 	CommonT
 
@@ -33,11 +39,14 @@ type T interface {
 	// Do not use the test-scope cleanup with shared resources.
 	Cleanup(fn func())
 
-	// Run runs the given function in as a sub-test.
+	// Run runs the given function as a sub-test.
+	// This requires the wrapped testing.TB to be a *testing.T: sub-benchmarks are not supported.
 	Run(name string, fn func(T))
 
-	// Context returns a context that will be canceled at the end of this (sub) test-scope,
-	// and inherits the context of the parent-test-scope.
+	// Context returns a context that is canceled just before the Cleanup functions run,
+	// like testing.TB.Context. Cleanup functions can wait for resources that shut down on Context().Done().
+	// The context inherits the values and cancellation of the parent-test-scope (or RootContext).
+	// If the test has a deadline, the context expires 3 seconds before it.
 	Context() context.Context
 
 	// WithContext makes a copy of T with a specific context.
@@ -66,8 +75,18 @@ type T interface {
 	// Output returns a writer to write to the underlying TB.Output
 	Output() io.Writer
 
-	// This distinguishes the interface from other testing interfaces,
-	// such as the one used at package-level for shared system construction.
+	// Helper marks the calling function as a test helper function.
+	// Output is attributed to the first caller that is not a helper.
+	Helper()
+
+	// Fatal is equivalent to Log followed by FailNow, but logged at error level.
+	Fatal(args ...any)
+	// Fatalf is equivalent to Logf followed by FailNow, but logged at error level.
+	Fatalf(format string, args ...any)
+
+	// TestOnly distinguishes the interface from other testing interfaces,
+	// such as P, the one used at package-level for shared resources.
+	// It is a no-op marker: implementations outside of this package can implement it.
 	TestOnly()
 
 	testing.TB
@@ -78,16 +97,22 @@ var _ mustbe.MT = T(nil)
 
 // testingT implements the T interface by wrapping around a regular golang testing.T
 type testingT struct {
-	testing.TB // embedded, so there is no indirection, to make Helper() calls accurate.
+	testing.TB // embedded, to forward the testing.TB methods that T does not override.
 	logger     log.Logger
 	ctx        context.Context
+	// helpers is shared with the copies made by WithContext.
+	helpers *helperSet
+}
+
+func (t *testingT) Helper() {
+	t.helpers.mark(1)
 }
 
 func (t *testingT) Error(args ...any) {
 	t.Helper()
 	// Note: the test-logger catches panics when the test is logged to after test-end.
 	// Note: we do not use t.Error directly, to keep the log-formatting more consistent.
-	t.logger.Error(fmt.Sprintln(args...))
+	logAt(t.logger, t.helpers, log.LevelError, sprintln(args...))
 	t.Fail()
 }
 
@@ -95,12 +120,23 @@ func (t *testingT) Errorf(format string, args ...any) {
 	t.Helper()
 	// Note: the test-logger catches panics when the test is logged to after test-end.
 	// Note: we do not use t.Errorf directly, to keep the log-formatting more consistent.
-	t.logger.Error(fmt.Sprintf(format, args...))
+	logAt(t.logger, t.helpers, log.LevelError, fmt.Sprintf(format, args...))
 	t.Fail()
 }
 
-func (t *testingT) Fail() {
+func (t *testingT) Fatal(args ...any) {
 	t.Helper()
+	t.Error(args...)
+	t.FailNow()
+}
+
+func (t *testingT) Fatalf(format string, args ...any) {
+	t.Helper()
+	t.Errorf(format, args...)
+	t.FailNow()
+}
+
+func (t *testingT) Fail() {
 	// if we already closed and failed, then this error is stale
 	if t.ctx.Err() != nil && t.Failed() {
 		return
@@ -109,7 +145,6 @@ func (t *testingT) Fail() {
 }
 
 func (t *testingT) FailNow() {
-	t.Helper()
 	// If we already closed and failed the test-scope, then there is nothing to do.
 	// This happens on e.g. a go-routine spawned by an Eventually-assertion, when the time runs out,
 	// the ctx is closed, a shared resource fails to do a lookup because of the ctx-timeout,
@@ -141,14 +176,14 @@ func (t *testingT) Log(args ...any) {
 	t.Helper()
 	// Note: the test-logger catches panics when the test is logged to after test-end.
 	// Note: we do not use t.Log directly, to keep the log-formatting more consistent.
-	t.logger.Info(fmt.Sprintln(args...))
+	logAt(t.logger, t.helpers, log.LevelInfo, sprintln(args...))
 }
 
 func (t *testingT) Logf(format string, args ...any) {
 	t.Helper()
 	// Note: the test-logger catches panics when the test is logged to after test-end.
 	// Note: we do not use t.Logf directly, to keep the log-formatting more consistent.
-	t.logger.Info(fmt.Sprintf(format, args...))
+	logAt(t.logger, t.helpers, log.LevelInfo, fmt.Sprintf(format, args...))
 }
 
 func (t *testingT) Name() string {
@@ -169,71 +204,51 @@ func (t *testingT) WithContext(ctx context.Context) T {
 	t.Mustf(be.Equal(expected, got), "cannot replace context with different test-scope")
 	logger := t.logger.WithContext(ctx)
 	out := &testingT{
-		TB:     t.TB,
-		logger: logger,
-		ctx:    ctx,
+		TB:      t.TB,
+		logger:  logger,
+		ctx:     ctx,
+		helpers: t.helpers,
 	}
 	return out
 }
 
 func (t *testingT) Must(a assertion.Assertion) {
-	t.TB.Helper()
-	t.mustf(a, "")
+	t.Helper()
+	mustbe.Must(t, a)
 }
 
 func (t *testingT) Mustf(a assertion.Assertion, msg string, args ...any) {
-	t.TB.Helper()
-	t.mustf(a, msg, args...)
-}
-
-func (t *testingT) mustf(c assertion.Assertion, msg string, args ...any) {
-	defer func() {
-		e := recover()
-		if e != nil {
-			t.Error("panic in assertion", e)
-			t.FailNow()
-		}
-	}()
-	ctx := t.Context()
-	err := c.Check(ctx)
-	if err != nil {
-		t.Helper()
-		if msg != "" {
-			err = fmt.Errorf("%w: %s", err, fmt.Sprintf(msg, args...))
-		}
-		t.Error("assertion failed:", err)
-		t.FailNow()
-	}
+	t.Helper()
+	mustbe.Must(t, assertion.Annotated{Inner: a, Msg: msg, Args: args})
 }
 
 func (t *testingT) Run(name string, fn func(T)) {
+	t.Helper()
 	if tt, ok := t.TB.(*testing.T); ok {
 		tt.Run(name, func(subGoT *testing.T) {
-			ctx := AddTestScope(t.ctx, name)
-			ctx, cancel := context.WithCancel(ctx)
-			subGoT.Cleanup(cancel)
+			ctx := scopeContext(AddTestScope(t.ctx, name), subGoT)
 			logger := t.logger.WithContext(ctx) // attach the sub-test context as default log-context
 			subT := &testingT{
-				TB:     subGoT,
-				logger: logger,
-				ctx:    ctx,
+				TB:      subGoT,
+				logger:  logger,
+				ctx:     ctx,
+				helpers: newHelperSet(),
 			}
 			fn(subT)
 		})
 	} else {
-		t.Helper()
 		t.Error("Must be in test env to run sub-test")
 		t.FailNow()
 	}
 }
 
 func (t *testingT) Parallel() {
+	t.Helper()
 	tt, ok := t.TB.(TestParallel)
 	if ok {
-		t.logger.Info("Running test in parallel")
+		t.Log("Running test in parallel")
 		tt.Parallel()
 	} else {
-		t.Helper()
 		t.Error("Must be in test env to run in parallel")
 		t.FailNow()
 	}
@@ -243,11 +258,6 @@ func (t *testingT) Skip(args ...any) {
 	t.Helper()
 	t.Log(args...)
 	t.SkipNow()
-}
-
-func (t *testingT) Skipped() bool {
-	t.Helper()
-	return t.Skipped()
 }
 
 func (t *testingT) Skipf(format string, args ...any) {
@@ -263,7 +273,7 @@ func (t *testingT) SkipNow() {
 		t.FailNow()
 		return
 	}
-	t.SkipNow()
+	t.TB.SkipNow()
 }
 
 // Deadline reports the time at which the test binary will have
@@ -281,29 +291,25 @@ func (t *testingT) Output() io.Writer {
 	return t.TB.Output()
 }
 
-func (t *testingT) TestOnly() {
-	panic("do not use - this method only forces the interface to be unique")
-}
+func (t *testingT) TestOnly() {}
 
 var _ T = (*testingT)(nil)
 
 // DefaultTestLogLevel is set to info level to show relevant logs without being overly verbose unless configured otherwise.
 var DefaultTestLogLevel = log.LevelInfo
 
-// SerialT wraps around a test-logger and turns it into a T for devstack testing.
+// SerialT wraps around a testing.TB, and turns it into a T.
+// The T context has the values of RootContext, is canceled just before the Cleanup functions run
+// (like testing.TB.Context), and expires 3 seconds before the test deadline, if any (see TestDeadline).
 func SerialT(t testing.TB) T {
-	ctx := RootContext
-	ctx = AddTestScope(ctx, t.Name())
-
-	var cancel context.CancelFunc
+	ctx := scopeContext(AddTestScope(RootContext, t.Name()), t)
 	if tt, ok := t.(TestDeadline); ok {
 		if deadline, hasDeadline := tt.Deadline(); hasDeadline {
+			var cancel context.CancelFunc
 			ctx, cancel = context.WithDeadline(ctx, deadline.Add(-3*time.Second))
-		} else {
-			ctx, cancel = context.WithCancel(ctx)
+			t.Cleanup(cancel)
 		}
 	}
-	t.Cleanup(cancel)
 
 	logger := log.TestLogger(t, log.LevelMod(DefaultTestLogLevel))
 	// Set the default context:
@@ -311,14 +317,16 @@ func SerialT(t testing.TB) T {
 	// utils will close resources based on this.
 	logger = logger.WithContext(ctx)
 	out := &testingT{
-		TB:     t,
-		logger: logger,
-		ctx:    ctx,
+		TB:      t,
+		logger:  logger,
+		ctx:     ctx,
+		helpers: newHelperSet(),
 	}
 	return out
 }
 
-// ParallelT creates a T interface with parallel testing enabled by default
+// ParallelT creates a T interface with parallel testing enabled by default.
+// This requires the testing.TB to support Parallel (see TestParallel).
 func ParallelT(t testing.TB) T {
 	out := SerialT(t)
 	out.Parallel()

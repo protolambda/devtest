@@ -20,9 +20,10 @@ Changes:
 - No `Gate` for test-skips
 - Use improved logger package
 - Add new `Output() io.Writer` to `T`
-- Embed `testing.TB` into:
-  - `testingT` for accurate `t.Helper()` stack inspection
-  - `T` for extended interface
+- Embed `testing.TB` into `T`, so a `T` can be used as `testing.TB`.
+  Output (`Log`, `Error`, `Fatal`, `Skip`, and their `f` variants) goes through the logger instead,
+  attributed to the first caller that is not marked with `t.Helper()`.
+- Assertions (`t.Must`, `t.Mustf`) are delegated to [`mustbe`](https://github.com/protolambda/mustbe).
 - Add `Run()` for managed `P` execution and shutdown using `runtime.Goexit` for go-routine
   to close the routine (with defers) gracefully, instead of a panic or other shortcut way.
 - Improved error handling
