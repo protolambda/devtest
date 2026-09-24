@@ -7,6 +7,7 @@ import (
 	"os"
 	"sync"
 
+	"github.com/protolambda/mustbe"
 	"github.com/protolambda/mustbe/assertion"
 	"github.com/protolambda/mustbe/be"
 	"github.com/protolambda/proto-log/log"
@@ -14,14 +15,20 @@ import (
 
 var FailNoMsg = errors.New("fail (no message)")
 
-// P is used by the preset package and system backends as testing interface, to host package-wide resources.
+// P is the package-scope testing interface, to host resources shared between tests,
+// e.g. in TestMain, or in test-like Go programs (see Run).
 type P interface {
 	CommonT
 
 	// WithContext makes a copy of P with a specific context.
 	// The ctx must match the test-scope of the existing context.
 	// This function is used to create a P with annotated context, e.g. a specific resource.
+	// The copy shares the cleanup and the error handling with the original.
 	WithContext(ctx context.Context) P
+
+	// Context returns the package-scope context.
+	// Like T, the context is canceled just before the Cleanup functions run (see Close).
+	Context() context.Context
 
 	// TempDir creates a temporary directory, and returns the file-path.
 	// This directory is cleaned up at the end of the package,
@@ -33,11 +40,12 @@ type P interface {
 	// These resources can thus be shared safely between tests.
 	Cleanup(fn func())
 
-	// This distinguishes the interface from other testing interfaces,
-	// such as the one used at test-level for test-scope resources.
-	_PackageOnly()
+	// PackageOnly distinguishes the interface from other testing interfaces,
+	// such as T, the one used at test-level for test-scope resources.
+	// It is a no-op marker: implementations outside of this package can implement it.
+	PackageOnly()
 
-	// Close closes the testing handle. This cancels the context and runs all cleanup.
+	// Close closes the testing handle. This cancels the context and then runs all cleanup.
 	Close()
 }
 
@@ -50,6 +58,14 @@ type implP struct {
 	// logger is used for logging. Regular test errors will also be redirected to get logged here.
 	logger log.Logger
 
+	ctx context.Context
+
+	// shared with the copies made by WithContext
+	*pShared
+}
+
+// pShared is the state of P that is shared between the copies made by WithContext.
+type pShared struct {
 	// onErr will be called to register an error (soft-error, or critical before onFail)
 	onErr func(err error)
 	// onFailNow will be called to register a critical failure.
@@ -58,8 +74,10 @@ type implP struct {
 	// onSkipNow will be called to skip the test immediately.
 	onSkipNow func()
 
-	ctx    context.Context
+	// cancel cancels the package-scope context
 	cancel context.CancelFunc
+
+	helpers *helperSet
 
 	// cleanup stack
 	cleanupLock    sync.Mutex
@@ -69,14 +87,16 @@ type implP struct {
 var _ P = (*implP)(nil)
 
 func (t *implP) Error(args ...any) {
-	errMsg := fmt.Sprintln(args...)
-	t.logger.Error(errMsg)
+	t.Helper()
+	errMsg := sprintln(args...)
+	logAt(t.logger, t.helpers, log.LevelError, errMsg)
 	t.onErr(errors.New(errMsg))
 }
 
 func (t *implP) Errorf(format string, args ...any) {
+	t.Helper()
 	errMsg := fmt.Sprintf(format, args...)
-	t.logger.Error(errMsg)
+	logAt(t.logger, t.helpers, log.LevelError, errMsg)
 	t.onErr(errors.New(errMsg))
 }
 
@@ -89,6 +109,7 @@ func (t *implP) FailNow() {
 }
 
 func (t *implP) SkipNow() {
+	t.Helper()
 	if IsMustNotSkip(t.ctx) {
 		t.Error("Unexpected test-skip")
 		t.FailNow()
@@ -98,8 +119,9 @@ func (t *implP) SkipNow() {
 }
 
 func (t *implP) TempDir() string {
+	t.Helper()
 	// The last "*" will be replaced with the random temp dir name
-	tempDir, err := os.MkdirTemp("", "op-dev-*")
+	tempDir, err := os.MkdirTemp("", "devtest-*")
 	if err != nil {
 		t.Errorf("failed to create temp dir: %v", err)
 		t.FailNow()
@@ -127,15 +149,19 @@ func (t *implP) CleanupErr(fn func() error) {
 }
 
 func (t *implP) Log(args ...any) {
-	t.logger.Info(fmt.Sprintln(args...))
+	t.Helper()
+	logAt(t.logger, t.helpers, log.LevelInfo, sprintln(args...))
 }
 
 func (t *implP) Logf(format string, args ...any) {
-	t.logger.Info(fmt.Sprintf(format, args...))
+	t.Helper()
+	logAt(t.logger, t.helpers, log.LevelInfo, fmt.Sprintf(format, args...))
 }
 
+// Helper marks the calling function as a helper function.
+// Output is attributed to the first caller that is not a helper.
 func (t *implP) Helper() {
-	// no-op
+	t.helpers.mark(1)
 }
 
 func (t *implP) Name() string {
@@ -150,59 +176,27 @@ func (t *implP) Context() context.Context {
 	return t.ctx
 }
 
-type wrapP struct {
-	ctx    context.Context
-	logger log.Logger
-	P
-}
-
-var _ P = (*wrapP)(nil)
-
-func (p *wrapP) Context() context.Context {
-	return p.ctx
-}
-
-func (p *wrapP) Logger() log.Logger {
-	return p.logger
-}
-
 func (t *implP) WithContext(ctx context.Context) P {
+	t.Helper()
 	expected := TestScope(t.ctx)
 	got := TestScope(ctx)
 	t.Mustf(be.Equal(expected, got), "cannot replace context with different test-scope")
-	logger := t.logger.WithContext(ctx)
-	out := &wrapP{ctx: ctx, logger: logger, P: t}
-	return out
+	return &implP{
+		scopeName: t.scopeName,
+		logger:    t.logger.WithContext(ctx),
+		ctx:       ctx,
+		pShared:   t.pShared,
+	}
 }
 
 func (t *implP) Must(a assertion.Assertion) {
 	t.Helper()
-	t.mustf(a, "")
+	mustbe.Must(t, a)
 }
 
 func (t *implP) Mustf(a assertion.Assertion, msg string, args ...any) {
 	t.Helper()
-	t.mustf(a, msg, args...)
-}
-
-func (t *implP) mustf(c assertion.Assertion, msg string, args ...any) {
-	defer func() {
-		e := recover()
-		if e != nil {
-			t.Error("panic in assertion", e)
-			t.FailNow()
-		}
-	}()
-	ctx := t.Context()
-	err := c.Check(ctx)
-	if err != nil {
-		t.Helper()
-		if msg != "" {
-			err = fmt.Errorf("%w: %s", err, fmt.Sprintf(msg, args...))
-		}
-		t.Error("assertion failed:", err)
-		t.FailNow()
-	}
+	mustbe.Must(t, assertion.Annotated{Inner: a, Msg: msg, Args: args})
 }
 
 // Close runs the cleanup of this implP implementation.
@@ -214,6 +208,11 @@ func (t *implP) mustf(c assertion.Assertion, msg string, args ...any) {
 // even continuing to clean up when panics happen.
 // It does not recover the go-routine from panicking however, that is up to the caller.
 func (t *implP) Close() {
+	t.cancel()
+	t.runCleanup()
+}
+
+func (t *implP) runCleanup() {
 	// run remaining cleanups, even if a cleanup panics,
 	// but don't recover the panic
 	defer func() {
@@ -222,7 +221,7 @@ func (t *implP) Close() {
 		t.cleanupLock.Unlock()
 		if recur {
 			t.logger.Error("Last cleanup panicked, continuing cleanup attempt now")
-			t.Close()
+			t.runCleanup()
 		}
 	}()
 
@@ -244,20 +243,21 @@ func (t *implP) Close() {
 	}
 }
 
-func (t *implP) _PackageOnly() {
-	panic("do not use - this method only forces the interface to be unique")
-}
+func (t *implP) PackageOnly() {}
 
 func NewP(ctx context.Context, logger log.Logger, onErr func(err error), onFailNow func(), onSkipNow func()) P {
 	ctx, cancel := context.WithCancel(ctx)
 	out := &implP{
 		scopeName: "pkg",
 		logger:    logger,
-		onErr:     onErr,
-		onFailNow: onFailNow,
-		onSkipNow: onSkipNow,
 		ctx:       AddTestScope(ctx, "pkg"),
-		cancel:    cancel,
+		pShared: &pShared{
+			onErr:     onErr,
+			onFailNow: onFailNow,
+			onSkipNow: onSkipNow,
+			cancel:    cancel,
+			helpers:   newHelperSet(),
+		},
 	}
 	return out
 }

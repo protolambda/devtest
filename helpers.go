@@ -10,7 +10,6 @@ import (
 func Parallel[V any](t T, elems []V, fn func(t T, v V)) {
 	t.Run("group", func(t T) {
 		for _, elem := range elems {
-			elem := elem
 			t.Run(fmt.Sprintf("%v", elem), func(t T) {
 				t.Parallel()
 				fn(t, elem)

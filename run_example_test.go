@@ -69,8 +69,7 @@ func ExampleMustNotSkip() {
 	// Output:
 	// INFO  Hello world                              foo=123
 	// ERROR Unexpected test-skip
-	//
-	// INFO  wrapped error:                           err="run err: Unexpected test-skip\n\ncritical error"
+	// INFO  wrapped error:                           err="run err: Unexpected test-skip\ncritical error"
 	// INFO  has stack trace:                         has=true
 	// INFO  Done!
 }
